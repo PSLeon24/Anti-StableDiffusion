@@ -93,6 +93,9 @@ stable-diffusion-attack/
 ## 3. Implementation
 
 ## 4. Testing
+### Metrics:
+ - LPIPS Distance: Evaluates perceptual similarity between original and adversarial outputs.
+ - SSIM Score: Measures structural similarity between original and adversarial outputs.
 
 ## 5. Maintenance
 
