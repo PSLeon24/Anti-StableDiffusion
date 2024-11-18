@@ -7,7 +7,6 @@ from tqdm import tqdm
 import time
 from torchvision import transforms
 import lpips  # LPIPS 패키지 설치 필요: pip install lpips
-from torchmetrics.functional import structural_similarity_index_measure as ssim
 
 # 2. Set Device
 device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -21,20 +20,20 @@ def load_model(model_name="runwayml/stable-diffusion-v1-5"):
     pipe.enable_attention_slicing()  # 메모리 최적화
     return pipe
 
-# 4. Define Adversarial Attack on img2img Model Using Combined Losses
+# 4. Define Adversarial Attack on img2img Model Using Perceptual Loss
 class Img2ImgAdversarialAttack:
     def __init__(self, model, epsilon=0.2, alpha=0.01, steps=50, momentum_factor=0.9):
         self.model = model
-        self.epsilon = epsilon  # Maximum perturbation
-        self.alpha = alpha  # Step size
-        self.steps = steps  # Number of attack iterations
-        self.momentum_factor = momentum_factor  # Momentum factor
-        self.momentum = None  # Initialize momentum
-        # LPIPS loss function initialization
+        self.epsilon = epsilon  # 최대 섭동 크기
+        self.alpha = alpha  # 스텝 크기
+        self.steps = steps  # 반복 횟수
+        self.momentum_factor = momentum_factor  # 모멘텀 계수
+        self.momentum = None  # 모멘텀 초기화
+        # LPIPS 손실 함수 초기화
         self.loss_fn = lpips.LPIPS(net='vgg').to(device)
 
     def generate_adversarial(self, image, prompt):
-        # Preprocess input image
+        # 입력 이미지 텐서로 변환
         preprocess_input = transforms.Compose([
             transforms.Resize((512, 512)),
             transforms.ToTensor(),
@@ -43,55 +42,48 @@ class Img2ImgAdversarialAttack:
         input_tensor = preprocess_input(image).unsqueeze(0).to(device).float()
         original_image_tensor = input_tensor.clone().detach()
 
-        # Initialize perturbation
+        # 초기 섭동 추가
         perturbation = torch.empty_like(input_tensor).uniform_(-self.epsilon, self.epsilon)
         input_tensor = input_tensor + perturbation
         input_tensor = torch.clamp(input_tensor, 0, 1)
         input_tensor.requires_grad = True
 
-        self.momentum = torch.zeros_like(input_tensor)  # Initialize momentum
+        self.momentum = torch.zeros_like(input_tensor)  # 모멘텀 초기화
 
         for step in tqdm(range(self.steps), desc="Generating Adversarial Example", leave=False):
-            # Generate output image
+            # 모델을 사용하여 출력 이미지 생성
             output_image = self.model(prompt=prompt, image=input_tensor, strength=0.4, guidance_scale=5).images[0]
             output_tensor = preprocess_input(output_image).unsqueeze(0).to(device).float()
 
-            # LPIPS loss preprocessing
+            # LPIPS를 위한 텐서 전처리
             input_lpips = F.interpolate(input_tensor, size=(256, 256), mode='bilinear', align_corners=False)
             output_lpips = F.interpolate(output_tensor, size=(256, 256), mode='bilinear', align_corners=False)
 
-            # Normalize to [-1, 1]
+            # [-1, 1] 범위로 정규화
             input_lpips = (input_lpips - 0.5) / 0.5
             output_lpips = (output_lpips - 0.5) / 0.5
 
-            # Calculate LPIPS loss
-            lpips_loss = -self.loss_fn(output_lpips, input_lpips).mean()
-
-            # Calculate MSE loss
-            # mse_loss = F.mse_loss(output_tensor, original_image_tensor)
-
-            # Calculate SSIM loss
-            ssim_loss = 1 - ssim(output_tensor, original_image_tensor, data_range=1.0)
-
-            # Combined loss
-            loss = 500 * lpips_loss + 100 * ssim_loss # + mse_loss
+            # LPIPS 손실 계산
+            loss = -self.loss_fn(output_lpips, input_lpips)
+            loss = loss.mean()
             loss.backward()
 
-            # Update momentum and apply perturbation
+            # 모멘텀 업데이트
             grad = input_tensor.grad
             self.momentum = self.momentum_factor * self.momentum + grad / (grad.norm() + 1e-8)
+
+            # 섭동 적용
             input_tensor = input_tensor + self.alpha * self.momentum.sign()
             input_tensor = torch.clamp(input_tensor, 0, 1)
 
-            # Ensure perturbation is within epsilon bounds
+            # 섭동이 epsilon 내에 있도록 클리핑
             perturbation = torch.clamp(input_tensor - original_image_tensor, -self.epsilon, self.epsilon)
             input_tensor = original_image_tensor + perturbation
             input_tensor = input_tensor.detach().requires_grad_(True)
 
-        # Convert final adversarial image tensor to PIL format
+        # 최종 적대적 이미지 변환
         adversarial_image = transforms.ToPILImage()(input_tensor.squeeze().cpu())
         return adversarial_image
-
 
 # 5. Main Execution
 if __name__ == "__main__":
@@ -103,16 +95,16 @@ if __name__ == "__main__":
     model = load_model(model_name)
 
     # Define attack parameters
-    epsilon = 2 / 255  # Maximum noise level
-    alpha = 0.5  # Step size
-    steps = 100  # Number of attack iterations
+    epsilon = 8/255  # Maximum noise level
+    alpha = 0.05   # Step size
+    steps = 100     # Number of attack iterations
     prompt = "portrait of a person with a neutral expression, purple hair"
 
     # Initialize attack
     attack = Img2ImgAdversarialAttack(model=model, epsilon=epsilon, alpha=alpha, steps=steps)
 
     # Load input image and resize to 512x512
-    input_image = Image.open("./Test/000001.jpg").convert("RGB").resize((512, 512))
+    input_image = Image.open("./Test/000005.jpg").convert("RGB").resize((512, 512))
 
     # Generate adversarial example
     start_time = time.time()
@@ -132,12 +124,6 @@ if __name__ == "__main__":
     adversarial_output.save("adversarial_output.png")
     adversarial_output.show()
 
-    # Optional: Print Variance of the output image
-    output_tensor = transforms.ToTensor()(adversarial_output).unsqueeze(0).to(device).float()
-    variance = torch.var(output_tensor).item()
-    print(f"Variance of the adversarial output: {variance:.4f}")
-
-    # LPIPS distance between input image and adversarial output
     # Optional: Calculate and print LPIPS distance
     preprocess = transforms.Compose([
         transforms.Resize((512, 512)),
@@ -147,6 +133,7 @@ if __name__ == "__main__":
     input_tensor = preprocess(input_image).unsqueeze(0).to(device)
     adversarial_output_tensor = preprocess(adversarial_output).unsqueeze(0).to(device)
 
+    # LPIPS distance between input image and adversarial output
     lpips_loss_fn = lpips.LPIPS(net='vgg').to(device)
     lpips_adversarial = lpips_loss_fn(input_tensor, adversarial_output_tensor).item()
     print(f"LPIPS distance between input image and adversarial output: {lpips_adversarial:.4f}")

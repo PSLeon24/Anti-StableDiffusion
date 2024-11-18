@@ -68,18 +68,18 @@ class Img2ImgAdversarialAttack:
             lpips_loss = -self.loss_fn(output_lpips, input_lpips).mean()
 
             # Calculate MSE loss
-            # mse_loss = F.mse_loss(output_tensor, original_image_tensor)
+            #mse_loss = F.mse_loss(output_tensor, original_image_tensor)
 
             # Calculate SSIM loss
             ssim_loss = 1 - ssim(output_tensor, original_image_tensor, data_range=1.0)
 
             # Combined loss
-            loss = 500 * lpips_loss + 100 * ssim_loss # + mse_loss
+            loss = lpips_loss # + 0.4 * ssim_loss # + mse_loss
             loss.backward()
 
             # Update momentum and apply perturbation
             grad = input_tensor.grad
-            self.momentum = self.momentum_factor * self.momentum + grad / (grad.norm() + 1e-8)
+            self.momentum = self.momentum_factor * self.momentum + grad / (grad.norm() + 1e-8) # 0으로 나뉘는걸 막기 위해서
             input_tensor = input_tensor + self.alpha * self.momentum.sign()
             input_tensor = torch.clamp(input_tensor, 0, 1)
 
@@ -104,8 +104,8 @@ if __name__ == "__main__":
 
     # Define attack parameters
     epsilon = 2 / 255  # Maximum noise level
-    alpha = 0.5  # Step size
-    steps = 100  # Number of attack iterations
+    alpha = 0.1  # Step size
+    steps = 10  # Number of attack iterations
     prompt = "portrait of a person with a neutral expression, purple hair"
 
     # Initialize attack
