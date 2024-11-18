@@ -15,7 +15,7 @@ Pretrained checkpoints of different Stable Diffusion versions can be downloaded 
 |Version|Link|
 |:--:|:--:|
 |2.1|<a href="https://huggingface.co/stabilityai/stable-diffusion-2-1-base">stable-diffusion-2-1-base</a>|
-|1.5|<a href="https://huggingface.co/stable-diffusion-v1-5/stable-diffusion-v1-5">stable-diffusion-v1-5-base</a>|
+|1.5|<a href="https://huggingface.co/stable-diffusion-v1-5/stable-diffusion-v1-5">stable-diffusion-v1-5</a>|
 |1.4|<a href="https://huggingface.co/CompVis/stable-diffusion-v1-4">stable-diffusion-v1-4</a>|
 
 ### Usage
