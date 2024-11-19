@@ -8,6 +8,7 @@ The goal of this project is to advance our research on disrupting deepfakes to a
 Deepfake-Shield is a system designed to counter deepfake technology by introducing methods that actively disrupt the deepfake generation process or degrade the quality of deepfakes to make them less convincing. By leveraging adversarial techniques, noise injection, and data manipulation, this project provides a proactive approach to mitigating the risks posed by deepfake technology.
 
 ### Result
+![image](https://github.com/user-attachments/assets/1177b9f3-b90e-4446-abad-efc6bae5575f)
 
 ### Environment Setup
 
