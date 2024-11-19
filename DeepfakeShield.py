@@ -9,10 +9,12 @@ from torchvision import transforms
 import lpips  # LPIPS: pip install lpips
 from torchmetrics.functional import structural_similarity_index_measure as ssim
 from torchmetrics.functional import peak_signal_noise_ratio as psnr
-from torch.autograd import Variable
+import numpy as np
 import random
 import warnings
 import time
+import os
+import csv
 
 # FutureWarning 무시
 warnings.filterwarnings("ignore", category=FutureWarning)
@@ -56,8 +58,9 @@ class Img2ImgAdversarialAttack:
         ])
 
         input_tensor = preprocess_input(image).unsqueeze(0).to(device).float()
+        random_init = torch.rand_like(input_tensor) * (self.adversarial_budget / 2)
+        adv_img = torch.clamp(input_tensor + random_init, 0, 1).requires_grad_(True)
         original_image_tensor = input_tensor.clone().detach()
-        adv_img = input_tensor.clone().detach().requires_grad_(True)
         self.momentum = torch.zeros_like(input_tensor)
 
         for step in tqdm(range(self.steps), desc="Generating adversarial example", leave=False):
@@ -73,51 +76,61 @@ class Img2ImgAdversarialAttack:
             output_tensor = preprocess_input(output_image).unsqueeze(0).to(device).float()
 
             # LPIPS 손실
-            input_lpips = F.interpolate(adv_img, size=(256, 256), mode='bilinear', align_corners=False)
-            output_lpips = F.interpolate(output_tensor, size=(256, 256), mode='bilinear', align_corners=False)
+            input_lpips = adv_img
+            output_lpips = output_tensor
 
             input_lpips = (input_lpips - 0.5) / 0.5
             output_lpips = (output_lpips - 0.5) / 0.5
 
-            lpips_loss = -self.loss_fn(output_lpips, input_lpips).mean()
+            lpips_loss = self.loss_fn(output_lpips, input_lpips).mean()
             ssim_loss = 1 - ssim(output_tensor, original_image_tensor, data_range=1.0)
-            brightness_loss = -torch.mean(torch.abs(output_tensor - original_image_tensor))
-            kl_loss = F.kl_div(F.log_softmax(output_tensor, dim=-1), F.softmax(original_image_tensor, dim=-1), reduction="batchmean")
+            brightness_loss = torch.mean(torch.abs(output_tensor - original_image_tensor))
 
-            # 최종 손실 계산
-            loss = lpips_loss + ssim_loss + brightness_loss + kl_loss
+
+            loss = 2 * lpips_loss + ssim_loss + brightness_loss
+
+            print(f"LPIPS Loss(↑): {lpips_loss.item():.4f}")
+            print(f"SSIM Loss(↓): {ssim_loss.item():.4f}")
+            print(f"Brightness Loss(↓): {brightness_loss.item():.4f}")
+
             loss.backward()
 
             # 섭동 업데이트
             with torch.no_grad():
-                grad = adv_img.grad.clone()  # NoneType 방지를 위해 grad 복사
-                grad_accumulated = grad + self.momentum
-                self.momentum = self.momentum_factor * self.momentum + grad_accumulated / (torch.norm(grad_accumulated) + 1e-8)
-                adv_img = adv_img + self.alpha * self.momentum.sign()
+                grad = adv_img.grad.clone()  # NoneType 방지를 위해 grad clone
+                grad_accumulated = grad + self.momentum  # 모멘텀 방향으로 그래디언트 누적
+                self.momentum_factor = random.uniform(0.8, 1.2)
+                self.momentum = self.momentum_factor * self.momentum - grad_accumulated / (torch.norm(grad_accumulated) + 1e-8) # BI-FGSM
+                adv_img = adv_img - self.alpha * self.momentum.sign()
                 eta = torch.clamp(adv_img - original_image_tensor, -self.adversarial_budget, self.adversarial_budget)
                 adv_img = torch.clamp(original_image_tensor + eta, 0, 1)
                 adv_img.requires_grad_(True)  # grad 활성화
 
-        adversarial_image_pil = transforms.ToPILImage()(adv_img.squeeze().cpu())
-        return adversarial_image_pil
+        adversarial_image = transforms.ToPILImage()(adv_img.squeeze().cpu())
+        return adversarial_image
 
 # 5. Main
 if __name__ == "__main__":
-    # torch.manual_seed(42)
+    # Set seed
+    seed = 42
+    torch.manual_seed(seed)
+    random.seed(seed)
+    np.random.seed(seed)
 
     # Load the model
     model_name = "stabilityai/stable-diffusion-2-1"
     model = load_model(model_name)
 
     # Load the input image
-    # input_image = Image.open("./Test/5.jpg").convert("RGB").resize((512, 512))
-    input_image = load_image("./Test/5.jpg")
-    prompt = "pink and blue hair"
+    input_image = load_image("./Test/5956.jpg")
+    prompt = "pink and blue hair, more larger eyes"
+    # "portrait of a person with a neutral expression, purple hair"
     # "A high-quality portrait of a young person, highly detailed, realistic, smiling, with distinctive features."
     # "pink and blue hair"
+    # "person with purple hair"
 
     # Initialize attack
-    attack = Img2ImgAdversarialAttack(model=model, adversarial_budget=16/255, alpha=4/255, steps=100)
+    attack = Img2ImgAdversarialAttack(model=model, adversarial_budget=11/255, alpha=4/255, steps=100)
     start_time = time.time()
     adversarial_image = attack.generate_adversarial(input_image, prompt)
     end_time = time.time()
@@ -154,14 +167,66 @@ if __name__ == "__main__":
     ssim_adversarial = ssim(adversarial_output_tensor, adversarial_tensor, data_range=1.0)
     psnr_adversarial = psnr(adversarial_output_tensor, adversarial_tensor, data_range=1.0)
 
-    print(f"Original LPIPS: {lpips_original:.4f}")
-    print(f"Adversarial LPIPS: {lpips_adversarial:.4f}")
-    print(f"Original SSIM: {ssim_original:.4f}")
-    print(f"Adversarial SSIM: {ssim_adversarial:.4f}")
-    print(f"Original PSNR: {psnr_original:.4f}")
-    print(f"Adversarial PSNR: {psnr_adversarial:.4f}")
+    # Print metrics
+    print(f"Original LPIPS(↑): {lpips_original:.4f}")
+    print(f"Adversarial LPIPS(↑): {lpips_adversarial:.4f}")
+    print(f"Original SSIM(↓): {ssim_original:.4f}")
+    print(f"Adversarial SSIM(↓): {ssim_adversarial:.4f}")
+    print(f"Original PSNR(↓): {psnr_original:.4f}")
+    print(f"Adversarial PSNR(↓): {psnr_adversarial:.4f}")
 
     # Text-to-image example
-    txt2img_model = load_txt2img_model(model_name)
-    test_image = txt2img_model(prompt="person riding a bike", guidance_scale=5.5).images[0]
-    test_image.show()
+    # txt2img_model = load_txt2img_model(model_name)
+    # test_image = txt2img_model(prompt="person riding a bike", guidance_scale=5.5).images[0]
+    # test_image.show()
+
+    # Create output directory if it doesn't exist
+    output_dir = "outputs"
+    os.makedirs(output_dir, exist_ok=True)
+
+    # CSV file to save metrics
+    csv_file = "metrics.csv"
+    with open(csv_file, mode="w", newline="") as file:
+        writer = csv.writer(file)
+        writer.writerow(["Filename", "Original_LPIPS", "Adversarial_LPIPS", "Original_SSIM", "Adversarial_SSIM", "Original_PSNR", "Adversarial_PSNR"])
+
+    # Process all JPG files in the Test directory
+    test_dir = "./Test"
+    for filename in os.listdir(test_dir):
+        if filename.lower().endswith(".jpg"):
+            file_path = os.path.join(test_dir, filename)
+
+            base_filename = os.path.splitext(filename)[0]
+
+            input_image = load_image(file_path)
+            prompt = "pink and blue hair, more larger eyes"
+
+            adversarial_image = attack.generate_adversarial(input_image, prompt)
+
+            adversarial_output = model(prompt, image=adversarial_image, strength=0.4, guidance_scale=5.5).images[0]
+            original_output = model(prompt, image=input_image, strength=0.4, guidance_scale=5.5).images[0]
+
+            adversarial_output.save(os.path.join(output_dir, f"{base_filename}_adversarial_output.png"))
+            original_output.save(os.path.join(output_dir, f"{base_filename}_original_output.png"))
+
+            # Calculate metrics
+            input_tensor = transforms.ToTensor()(input_image).unsqueeze(0).to(device)
+            adversarial_tensor = transforms.ToTensor()(adversarial_image).unsqueeze(0).to(device)
+            original_output_tensor = transforms.ToTensor()(original_output).unsqueeze(0).to(device)
+            adversarial_output_tensor = transforms.ToTensor()(adversarial_output).unsqueeze(0).to(device)
+
+            lpips_loss_fn = lpips.LPIPS(net='vgg').to(device)
+            lpips_original = lpips_loss_fn(input_tensor, original_output_tensor).item()
+            lpips_adversarial = lpips_loss_fn(adversarial_tensor, adversarial_output_tensor).item()
+
+            ssim_original = ssim(original_output_tensor, input_tensor, data_range=1.0).item()
+            psnr_original = psnr(original_output_tensor, input_tensor, data_range=1.0).item()
+
+            ssim_adversarial = ssim(adversarial_output_tensor, adversarial_tensor, data_range=1.0).item()
+            psnr_adversarial = psnr(adversarial_output_tensor, adversarial_tensor, data_range=1.0).item()
+
+            with open(csv_file, mode="a", newline="") as file:
+                writer = csv.writer(file)
+                writer.writerow([base_filename, lpips_original, lpips_adversarial, ssim_original, ssim_adversarial, psnr_original, psnr_adversarial])
+
+            print(f"Processed {filename}: Metrics saved.")
