@@ -1,40 +1,54 @@
-# 1. Import Dependencies
+# 1. 필요한 라이브러리 임포트
 import torch
 import torch.nn.functional as F
-from diffusers import StableDiffusionImg2ImgPipeline
+from diffusers import StableDiffusionImg2ImgPipeline, StableDiffusionPipeline, EulerAncestralDiscreteScheduler
 from PIL import Image
 from tqdm import tqdm
-import time
 from torchvision import transforms
-import lpips  # LPIPS 패키지 설치 필요: pip install lpips
+import lpips  # LPIPS: pip install lpips
 from torchmetrics.functional import structural_similarity_index_measure as ssim
+from torchmetrics.functional import peak_signal_noise_ratio as psnr
+from torch.autograd import Variable
+import random
+import warnings
+import time
 
-# 2. Set Device
+# FutureWarning 무시
+warnings.filterwarnings("ignore", category=FutureWarning)
+
+# 2. 디바이스 설정
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
-# 3. Load Stable Diffusion Model with img2img Pipeline from Hugging Face
-def load_model(model_name="runwayml/stable-diffusion-v1-5"):
-    """Load the Stable Diffusion img2img pipeline model."""
-    pipe = StableDiffusionImg2ImgPipeline.from_pretrained(model_name, torch_dtype=torch.float16)
-    pipe.safety_checker = None  # Disable the safety checker
+# 3. Hugging Face에서 Stable Diffusion 모델 로드
+def load_model(model_name="stabilityai/stable-diffusion-2-1"):
+    """Stable Diffusion img2img 파이프라인 모델 로드."""
+    pipe = StableDiffusionImg2ImgPipeline.from_pretrained(model_name, torch_dtype=torch.float16, use_auth_token=True)
+    pipe.safety_checker = None
     pipe = pipe.to(device)
-    pipe.enable_attention_slicing()  # 메모리 최적화
+    pipe.enable_attention_slicing()
+    pipe.scheduler = EulerAncestralDiscreteScheduler.from_config(pipe.scheduler.config)
     return pipe
 
-# 4. Define Adversarial Attack on img2img Model Using Combined Losses
+def load_txt2img_model(model_name="stabilityai/stable-diffusion-2-1"):
+    """Stable Diffusion txt2img 파이프라인 모델 로드."""
+    pipe = StableDiffusionPipeline.from_pretrained(model_name, torch_dtype=torch.float16, use_auth_token=True)
+    pipe.safety_checker = None
+    pipe = pipe.to(device)
+    pipe.enable_attention_slicing()
+    pipe.scheduler = EulerAncestralDiscreteScheduler.from_config(pipe.scheduler.config)
+    return pipe
+
+# 4. Define Adversarial Attack against img2img
 class Img2ImgAdversarialAttack:
-    def __init__(self, model, epsilon=0.2, alpha=0.01, steps=50, momentum_factor=0.9):
+    def __init__(self, model, adversarial_budget=16/255, alpha=1/255, steps=100, momentum_factor=0.9):
         self.model = model
-        self.epsilon = epsilon  # Maximum perturbation
-        self.alpha = alpha  # Step size
-        self.steps = steps  # Number of attack iterations
-        self.momentum_factor = momentum_factor  # Momentum factor
-        self.momentum = None  # Initialize momentum
-        # LPIPS loss function initialization
+        self.adversarial_budget = adversarial_budget
+        self.alpha = alpha
+        self.steps = steps
+        self.momentum_factor = momentum_factor
         self.loss_fn = lpips.LPIPS(net='vgg').to(device)
 
     def generate_adversarial(self, image, prompt):
-        # Preprocess input image
         preprocess_input = transforms.Compose([
             transforms.Resize((512, 512)),
             transforms.ToTensor(),
@@ -42,111 +56,104 @@ class Img2ImgAdversarialAttack:
 
         input_tensor = preprocess_input(image).unsqueeze(0).to(device).float()
         original_image_tensor = input_tensor.clone().detach()
+        adv_img = input_tensor.clone().detach().requires_grad_(True)
+        self.momentum = torch.zeros_like(input_tensor)
 
-        # Initialize perturbation
-        perturbation = torch.empty_like(input_tensor).uniform_(-self.epsilon, self.epsilon)
-        input_tensor = input_tensor + perturbation
-        input_tensor = torch.clamp(input_tensor, 0, 1)
-        input_tensor.requires_grad = True
+        for step in tqdm(range(self.steps), desc="Generating adversarial example", leave=False):
+            if adv_img.grad is not None:
+                adv_img.grad.zero_()
+            adv_img_ = (adv_img + 1.0) / 2.0
+            adv_img_ = torch.clamp(adv_img_, 0.0, 1.0)
 
-        self.momentum = torch.zeros_like(input_tensor)  # Initialize momentum
-
-        for step in tqdm(range(self.steps), desc="Generating Adversarial Example", leave=False):
-            # Generate output image
-            output_image = self.model(prompt=prompt, image=input_tensor, strength=0.4, guidance_scale=5).images[0]
+            # 이미지 생성
+            output_image = self.model(prompt=prompt, image=adv_img_, strength=0.6, guidance_scale=7.5).images[0]
             output_tensor = preprocess_input(output_image).unsqueeze(0).to(device).float()
 
-            # LPIPS loss preprocessing
-            input_lpips = F.interpolate(input_tensor, size=(256, 256), mode='bilinear', align_corners=False)
+            # LPIPS 손실
+            input_lpips = F.interpolate(adv_img, size=(256, 256), mode='bilinear', align_corners=False)
             output_lpips = F.interpolate(output_tensor, size=(256, 256), mode='bilinear', align_corners=False)
 
-            # Normalize to [-1, 1]
             input_lpips = (input_lpips - 0.5) / 0.5
             output_lpips = (output_lpips - 0.5) / 0.5
 
-            # Calculate LPIPS loss
             lpips_loss = -self.loss_fn(output_lpips, input_lpips).mean()
-
-            # Calculate MSE loss
-            # mse_loss = F.mse_loss(output_tensor, original_image_tensor)
-
-            # Calculate SSIM loss
             ssim_loss = 1 - ssim(output_tensor, original_image_tensor, data_range=1.0)
+            brightness_loss = -torch.mean(torch.abs(output_tensor - original_image_tensor))
 
-            # Combined loss
-            loss = 500 * lpips_loss + 100 * ssim_loss # + mse_loss
+            # 최종 손실 계산
+            loss = lpips_loss + ssim_loss + brightness_loss
             loss.backward()
 
-            # Update momentum and apply perturbation
-            grad = input_tensor.grad
-            self.momentum = self.momentum_factor * self.momentum + grad / (grad.norm() + 1e-8)
-            input_tensor = input_tensor + self.alpha * self.momentum.sign()
-            input_tensor = torch.clamp(input_tensor, 0, 1)
+            # 섭동 업데이트
+            with torch.no_grad():
+                grad = adv_img.grad.clone()  # NoneType 방지를 위해 grad 복사
+                grad_accumulated = grad + self.momentum
+                self.momentum = self.momentum_factor * self.momentum + grad_accumulated / (torch.norm(grad_accumulated) + 1e-8)
+                adv_img = adv_img + self.alpha * self.momentum.sign()
+                eta = torch.clamp(adv_img - original_image_tensor, -self.adversarial_budget, self.adversarial_budget)
+                adv_img = torch.clamp(original_image_tensor + eta, 0, 1)
+                adv_img.requires_grad_(True)  # grad 활성화
 
-            # Ensure perturbation is within epsilon bounds
-            perturbation = torch.clamp(input_tensor - original_image_tensor, -self.epsilon, self.epsilon)
-            input_tensor = original_image_tensor + perturbation
-            input_tensor = input_tensor.detach().requires_grad_(True)
+        adversarial_image_pil = transforms.ToPILImage()(adv_img.squeeze().cpu())
+        return adversarial_image_pil
 
-        # Convert final adversarial image tensor to PIL format
-        adversarial_image = transforms.ToPILImage()(input_tensor.squeeze().cpu())
-        return adversarial_image
-
-
-# 5. Main Execution
+# 5. Main
 if __name__ == "__main__":
-    # Set the random seed for reproducibility
     torch.manual_seed(42)
 
-    # Load model
-    model_name = "runwayml/stable-diffusion-v1-5"
+    # Load the model
+    model_name = "stabilityai/stable-diffusion-2-1"
     model = load_model(model_name)
 
-    # Define attack parameters
-    epsilon = 2 / 255  # Maximum noise level
-    alpha = 0.5  # Step size
-    steps = 100  # Number of attack iterations
-    prompt = "portrait of a person with a neutral expression, purple hair"
+    # Load the input image
+    input_image = Image.open("./Test/5.jpg").convert("RGB").resize((512, 512))
+    prompt = "A high-quality portrait of a young person, highly detailed, realistic, smiling, with distinctive features."
 
     # Initialize attack
-    attack = Img2ImgAdversarialAttack(model=model, epsilon=epsilon, alpha=alpha, steps=steps)
-
-    # Load input image and resize to 512x512
-    input_image = Image.open("./Test/000001.jpg").convert("RGB").resize((512, 512))
-
-    # Generate adversarial example
+    attack = Img2ImgAdversarialAttack(model=model, adversarial_budget=16/255, alpha=1/255, steps=100)
     start_time = time.time()
     adversarial_image = attack.generate_adversarial(input_image, prompt)
     end_time = time.time()
-    elapsed_time = end_time - start_time
-    print(f"Time taken to generate adversarial example: {elapsed_time:.2f} seconds")
 
-    # Generate output for the adversarial image
-    adversarial_output = model(prompt=prompt, image=adversarial_image, strength=0.4, guidance_scale=5).images[0]
-
-    # Save and show the adversarial image
-    adversarial_image.save("adversarial_image.png")
+    print(f"Adversarial example generated in {end_time - start_time:.2f} seconds.")
     adversarial_image.show()
+    adversarial_image.save("adversarial_image.png")
 
-    # Save and show the outputs
+    # Generate outputs
+    adversarial_output = model(prompt=prompt, image=adversarial_image, strength=0.6, guidance_scale=7.5).images[0]
+    original_output = model(prompt=prompt, image=input_image, strength=0.6, guidance_scale=7.5).images[0]
+
+    # Save and show outputs
     adversarial_output.save("adversarial_output.png")
     adversarial_output.show()
 
-    # Optional: Print Variance of the output image
-    output_tensor = transforms.ToTensor()(adversarial_output).unsqueeze(0).to(device).float()
-    variance = torch.var(output_tensor).item()
-    print(f"Variance of the adversarial output: {variance:.4f}")
+    original_output.save("original_output.png")
+    original_output.show()
 
-    # LPIPS distance between input image and adversarial output
-    # Optional: Calculate and print LPIPS distance
-    preprocess = transforms.Compose([
-        transforms.Resize((512, 512)),
-        transforms.ToTensor(),
-    ])
-
-    input_tensor = preprocess(input_image).unsqueeze(0).to(device)
-    adversarial_output_tensor = preprocess(adversarial_output).unsqueeze(0).to(device)
+    # LPIPS, SSIM, PSNR calculations
+    input_tensor = transforms.ToTensor()(input_image).unsqueeze(0).to(device)
+    adversarial_tensor = transforms.ToTensor()(adversarial_image).unsqueeze(0).to(device)
+    original_output_tensor = transforms.ToTensor()(original_output).unsqueeze(0).to(device)
+    adversarial_output_tensor = transforms.ToTensor()(adversarial_output).unsqueeze(0).to(device)
 
     lpips_loss_fn = lpips.LPIPS(net='vgg').to(device)
-    lpips_adversarial = lpips_loss_fn(input_tensor, adversarial_output_tensor).item()
-    print(f"LPIPS distance between input image and adversarial output: {lpips_adversarial:.4f}")
+    lpips_original = lpips_loss_fn(input_tensor, original_output_tensor).item()
+    lpips_adversarial = lpips_loss_fn(adversarial_tensor, adversarial_output_tensor).item()
+
+    ssim_original = ssim(original_output_tensor, input_tensor, data_range=1.0)
+    psnr_original = psnr(original_output_tensor, input_tensor, data_range=1.0)
+
+    ssim_adversarial = ssim(adversarial_output_tensor, adversarial_tensor, data_range=1.0)
+    psnr_adversarial = psnr(adversarial_output_tensor, adversarial_tensor, data_range=1.0)
+
+    print(f"Original LPIPS: {lpips_original:.4f}")
+    print(f"Adversarial LPIPS: {lpips_adversarial:.4f}")
+    print(f"Original SSIM: {ssim_original:.4f}")
+    print(f"Adversarial SSIM: {ssim_adversarial:.4f}")
+    print(f"Original PSNR: {psnr_original:.4f}")
+    print(f"Adversarial PSNR: {psnr_adversarial:.4f}")
+
+    # Text-to-image example
+    txt2img_model = load_txt2img_model(model_name)
+    test_image = txt2img_model(prompt="person riding a bike", guidance_scale=7).images[0]
+    test_image.show()
