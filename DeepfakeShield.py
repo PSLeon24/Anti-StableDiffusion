@@ -2,6 +2,7 @@
 import torch
 import torch.nn.functional as F
 from diffusers import StableDiffusionImg2ImgPipeline, StableDiffusionPipeline, EulerAncestralDiscreteScheduler
+from diffusers.utils import load_image
 from PIL import Image
 from tqdm import tqdm
 from torchvision import transforms
@@ -60,13 +61,15 @@ class Img2ImgAdversarialAttack:
         self.momentum = torch.zeros_like(input_tensor)
 
         for step in tqdm(range(self.steps), desc="Generating adversarial example", leave=False):
+            if step % 10 != 0:
+                continue
             if adv_img.grad is not None:
                 adv_img.grad.zero_()
             adv_img_ = (adv_img + 1.0) / 2.0
             adv_img_ = torch.clamp(adv_img_, 0.0, 1.0)
 
             # 이미지 생성
-            output_image = self.model(prompt=prompt, image=adv_img_, strength=0.6, guidance_scale=7.5).images[0]
+            output_image = self.model(prompt=prompt, image=adv_img_, strength=0.4, guidance_scale=5.5).images[0]
             output_tensor = preprocess_input(output_image).unsqueeze(0).to(device).float()
 
             # LPIPS 손실
@@ -79,9 +82,10 @@ class Img2ImgAdversarialAttack:
             lpips_loss = -self.loss_fn(output_lpips, input_lpips).mean()
             ssim_loss = 1 - ssim(output_tensor, original_image_tensor, data_range=1.0)
             brightness_loss = -torch.mean(torch.abs(output_tensor - original_image_tensor))
+            kl_loss = F.kl_div(F.log_softmax(output_tensor, dim=-1), F.softmax(original_image_tensor, dim=-1), reduction="batchmean")
 
             # 최종 손실 계산
-            loss = lpips_loss + ssim_loss + brightness_loss
+            loss = lpips_loss + ssim_loss + brightness_loss + kl_loss
             loss.backward()
 
             # 섭동 업데이트
@@ -99,18 +103,21 @@ class Img2ImgAdversarialAttack:
 
 # 5. Main
 if __name__ == "__main__":
-    torch.manual_seed(42)
+    # torch.manual_seed(42)
 
     # Load the model
     model_name = "stabilityai/stable-diffusion-2-1"
     model = load_model(model_name)
 
     # Load the input image
-    input_image = Image.open("./Test/5.jpg").convert("RGB").resize((512, 512))
-    prompt = "A high-quality portrait of a young person, highly detailed, realistic, smiling, with distinctive features."
+    # input_image = Image.open("./Test/5.jpg").convert("RGB").resize((512, 512))
+    input_image = load_image("./Test/5.jpg")
+    prompt = "pink and blue hair"
+    # "A high-quality portrait of a young person, highly detailed, realistic, smiling, with distinctive features."
+    # "pink and blue hair"
 
     # Initialize attack
-    attack = Img2ImgAdversarialAttack(model=model, adversarial_budget=16/255, alpha=1/255, steps=100)
+    attack = Img2ImgAdversarialAttack(model=model, adversarial_budget=16/255, alpha=4/255, steps=100)
     start_time = time.time()
     adversarial_image = attack.generate_adversarial(input_image, prompt)
     end_time = time.time()
@@ -120,8 +127,9 @@ if __name__ == "__main__":
     adversarial_image.save("adversarial_image.png")
 
     # Generate outputs
-    adversarial_output = model(prompt=prompt, image=adversarial_image, strength=0.6, guidance_scale=7.5).images[0]
-    original_output = model(prompt=prompt, image=input_image, strength=0.6, guidance_scale=7.5).images[0]
+    adversarial_output = model(prompt, image=adversarial_image, strength=0.4, guidance_scale=5.5).images[0] # model(prompt=prompt, image=adversarial_image, strength=0.4, guidance_scale=5.5).images[0]
+    original_output= model(prompt, image=input_image, strength=0.4, guidance_scale=5.5).images[0]
+    # original_output = model(prompt=prompt, image=input_image, strength=0.4, guidance_scale=5.5).images[0]
 
     # Save and show outputs
     adversarial_output.save("adversarial_output.png")
@@ -155,5 +163,5 @@ if __name__ == "__main__":
 
     # Text-to-image example
     txt2img_model = load_txt2img_model(model_name)
-    test_image = txt2img_model(prompt="person riding a bike", guidance_scale=7).images[0]
+    test_image = txt2img_model(prompt="person riding a bike", guidance_scale=5.5).images[0]
     test_image.show()
