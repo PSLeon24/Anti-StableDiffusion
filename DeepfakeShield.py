@@ -5,6 +5,7 @@ from torch import nn
 from diffusers import StableDiffusionImg2ImgPipeline, StableDiffusionPipeline, EulerAncestralDiscreteScheduler, DDIMScheduler
 from transformers import SegformerImageProcessor, SegformerForSemanticSegmentation
 from diffusers.utils import load_image
+import torchvision
 from torchvision import transforms
 from PIL import Image
 from tqdm import tqdm
@@ -30,7 +31,9 @@ def load_model(model_name="stabilityai/stable-diffusion-2-1"):
     pipe = StableDiffusionImg2ImgPipeline.from_pretrained(model_name, torch_dtype=torch.float16, use_auth_token=True)
     pipe.safety_checker = None
     pipe = pipe.to(device)
-    pipe.enable_attention_slicing()
+    pipe.enable_attention_slicing()  # Attention Slicing 활성화
+    pipe.enable_xformers_memory_efficient_attention()
+    # pipe.enable_xformers_memory_efficient_attention()  # 메모리 효율적 Attention
     pipe.scheduler = DDIMScheduler.from_config(pipe.scheduler.config)
     # pipe.scheduler = EulerAncestralDiscreteScheduler.from_config(pipe.scheduler.config)
     return pipe
@@ -46,31 +49,104 @@ def load_txt2img_model(model_name="stabilityai/stable-diffusion-2-1"):
 
 # 4. Define Adversarial Attack against img2img
 class Img2ImgAdversarialAttack:
-    def __init__(self, model, adversarial_budget=16/255, alpha=1/255, steps=100, momentum_factor=0.9, non_mask_budget=4/255, non_mask_alpha=1/255):
+    def __init__(self, model, vae, tokenizer, noise_scheduler, adversarial_budget=16/255, alpha=1/255, steps=100, momentum_factor=0.9, non_mask_budget=4/255, non_mask_alpha=0.5/255, random_start=True):
         self.model = model
+        self.vae = vae
+        self.tokenizer = tokenizer
+        self.noise_scheduler = noise_scheduler
         self.adversarial_budget = adversarial_budget
         self.alpha = alpha
         self.steps = steps
         self.momentum_factor = momentum_factor
-        self.loss_fn = lpips.LPIPS(net='vgg').to(device)
         self.non_mask_budget = non_mask_budget
         self.non_mask_alpha = non_mask_alpha
+        self.random_start = random_start
+        self.loss_fn = lpips.LPIPS(net='vgg').to(device)  # LPIPS 손실
         self.momentum = None
+        self.model.enable_attention_slicing()
+        self.model.enable_xformers_memory_efficient_attention()
 
-    def compute_denoising_loss(self, noisy_input, prompt):
-        """Compute denoising loss between input with noise and denoised output."""
-        denoised_output = self.model(prompt=prompt, image=noisy_input, strength=0.5, guidance_scale=5).images[0]
-        denoised_tensor = transforms.ToTensor()(denoised_output).unsqueeze(0).to(device)
-        denoising_loss = F.mse_loss(noisy_input, denoised_tensor)
-        return denoising_loss
+    def compute_loss(self, perturbed_images, input_tensor, model_pred, target_noise, mask_tensor, latent_original):
+        """결합된 손실 함수: LPIPS + TV 손실 + Diffusion 손실 + Gaussian Augmentation + Latent Feature Distortion"""
+        # LPIPS Loss (Perceptual 손실)
+        lpips_loss = self.loss_fn(perturbed_images, input_tensor).mean()
 
-    def generate_adversarial(self, image, prompt):
+        # TV Loss (Total Variation 손실)
+        tv_loss = torch.mean(torch.abs(perturbed_images[:, :, :-1] - perturbed_images[:, :, 1:])) + \
+                torch.mean(torch.abs(perturbed_images[:, :-1, :] - perturbed_images[:, 1:, :]))
+
+        # Diffusion Loss
+        diffusion_loss = F.mse_loss(model_pred, target_noise)
+
+        if mask_tensor is not None:
+            masked_lpips_loss = torch.sum(lpips_loss * mask_tensor) / torch.sum(mask_tensor)
+            masked_diffusion_loss = torch.sum(diffusion_loss * mask_tensor) / torch.sum(mask_tensor)
+        else:
+            masked_lpips_loss = lpips_loss
+            masked_diffusion_loss = diffusion_loss
+
+        # Gaussian Augmentation Loss
+        gaussian_perturbed = torchvision.transforms.GaussianBlur(kernel_size=(5, 5), sigma=(0.1, 2.0))(perturbed_images)
+        gaussian_loss = F.mse_loss(gaussian_perturbed, input_tensor)
+
+        # Latent Feature Distortion Loss
+        with torch.no_grad():
+            latent_perturbed = self.vae.encode(perturbed_images.to(dtype=torch.float16)).latent_dist.mean.to(dtype=torch.float32)
+        latent_loss = F.mse_loss(latent_original, latent_perturbed)
+
+        # 결합 손실
+        combined_loss = (
+            0.5 * (masked_lpips_loss + masked_diffusion_loss) +
+            0.2 * (((1 - mask_tensor).mean() * lpips_loss) + ((1 - mask_tensor).mean() * diffusion_loss)) +
+            0.1 * tv_loss +
+            0.1 * gaussian_loss +
+            0.1 * latent_loss
+        )
+        return combined_loss
+
+    def generate_adversarial(self, image, prompt, opposite_prompt="a distorted object"):
         preprocess_input = transforms.Compose([
             transforms.Resize((512, 512)),
             transforms.ToTensor(),
         ])
 
-        # 1. Segmentation using Segformer
+        # 1. 입력 텐서 준비
+        input_tensor = preprocess_input(image).unsqueeze(0).to(device).float()
+
+        # 2. 랜덤 초기화 (랜덤 시작 활성화 시)
+        if self.random_start:
+            random_noise = torch.rand_like(input_tensor) * self.adversarial_budget
+            input_tensor = torch.clamp(input_tensor + random_noise, 0, 1)
+
+        perturbed_images = input_tensor.clone().detach().requires_grad_(True)
+
+        # 3. 텍스트 프롬프트 토큰화
+        input_ids = self.tokenizer(
+            prompt,
+            truncation=True,
+            padding="max_length",
+            max_length=self.tokenizer.model_max_length,
+            return_tensors="pt",
+        ).input_ids.to(device)
+
+        # 4. 반대 프롬프트 토큰화
+        opposite_input_ids = self.tokenizer(
+            opposite_prompt,
+            truncation=True,
+            padding="max_length",
+            max_length=self.tokenizer.model_max_length,
+            return_tensors="pt",
+        ).input_ids.to(device)
+
+        # 5. 텍스트 인코더 출력 생성
+        encoder_hidden_states = self.model.text_encoder(input_ids).last_hidden_state
+        opposite_hidden_states = self.model.text_encoder(opposite_input_ids).last_hidden_state
+
+        # 텍스트 인코더에 교란 추가: 정반대 방향으로 임베딩을 왜곡
+        attack_strength = 0.3  # 교란 강도
+        perturbed_hidden_states = encoder_hidden_states + attack_strength * (opposite_hidden_states - encoder_hidden_states)
+
+        # 6. 마스킹 텐서 생성 (Segformer 사용)
         segformer_processor = SegformerImageProcessor.from_pretrained("jonathandinu/face-parsing")
         segformer_model = SegformerForSemanticSegmentation.from_pretrained("jonathandinu/face-parsing").to(device)
         segformer_inputs = segformer_processor(images=image, return_tensors="pt").to(device)
@@ -79,132 +155,102 @@ class Img2ImgAdversarialAttack:
         upsampled_logits = nn.functional.interpolate(logits, size=image.size[::-1], mode='bilinear', align_corners=False)
         labels = upsampled_logits.argmax(dim=1)[0]
 
-        # Define labels for specific regions
-        desired_labels = [3, 4, 5,  6, 7, 10, 11, 12]
+        desired_labels = [3, 4, 5, 6, 7, 10, 11, 12, 13]  # 얼굴 영역 (예: 눈, 입, 헤어 등)
         combined_mask = torch.zeros_like(labels, dtype=torch.long).cpu()
         for label in desired_labels:
             combined_mask = combined_mask | (labels == label).long().cpu()
 
-        # Convert mask to tensor
-        combined_mask_tensor = combined_mask.unsqueeze(0).to(device, dtype=torch.float32)
+        # 마스크를 텐서로 변환
+        mask_tensor = combined_mask.unsqueeze(0).to(device, dtype=torch.float32)
 
-        # 2. Prepare input tensor
-        input_tensor = preprocess_input(image).unsqueeze(0).to(device).float()
-
-        # Generate initial noise
-        random_init = torch.rand_like(input_tensor) * self.adversarial_budget
-        non_mask_random_init = torch.rand_like(input_tensor) * self.non_mask_budget
-        random_init = (random_init * combined_mask_tensor) + (non_mask_random_init * (1 - combined_mask_tensor))
-        perturbed_images = torch.clamp(input_tensor + random_init, 0, 1).requires_grad_(True)
-        original_images = input_tensor.clone().detach()
-
-        # Initialize momentum
-        self.momentum = torch.zeros_like(input_tensor)
-
-        # Initialize best loss and best adversarial image
         max_loss = -float('inf')
-        strongest_adv_img = None
+        best_adv_img = None
 
-        # 3. Tokenize the prompt
-        tokenizer = self.model.tokenizer
-        input_ids = tokenizer(
-            prompt,
-            truncation=True,
-            padding="max_length",
-            max_length=tokenizer.model_max_length,
-            return_tensors="pt",
-        ).input_ids.to(device)
-
-        # Set to mixed precision for reduced memory usage
-        weight_dtype = torch.float16
+        # 모멘텀 초기화
+        momentum = torch.zeros_like(input_tensor).to(device)
 
         for step in tqdm(range(self.steps), desc="Generating adversarial example"):
+            torch.cuda.empty_cache() 
             if perturbed_images.grad is not None:
                 perturbed_images.grad.zero_()
             if step % 10 != 0:
+                # torch.cuda.empty_cache()  # 주기적으로 캐시 해제
                 continue
 
-            perturbed_images_ = (perturbed_images + 1.0) / 2.0
-            perturbed_images_ = torch.clamp(perturbed_images_, 0.0, 1.0)
-            perturbed_images_ = perturbed_images_.to(dtype=weight_dtype)
+            perturbed_images_ = torch.clamp(perturbed_images, 0.0, 1.0)
 
-            # 4. Forward diffusion and noise addition
+            # VAE의 데이터 타입을 float16으로 변환
+            perturbed_images_ = perturbed_images_.to(dtype=torch.float16)  # 데이터 타입 변환
+
+            # 5. VAE 인코딩 및 노이즈 추가
             with torch.no_grad():
-                latents = self.model.vae.encode(perturbed_images_).latent_dist.sample()
-            noise = torch.randn_like(latents, dtype=weight_dtype)
-            timesteps = torch.randint(0, self.model.scheduler.num_train_timesteps, (1,), device=latents.device).long()
-            noisy_latents = self.model.scheduler.add_noise(latents, noise, timesteps)
-
-            # Predict noise residual
-            encoder_hidden_states = self.model.text_encoder(input_ids).last_hidden_state
-            model_pred = self.model.unet(noisy_latents, timesteps, encoder_hidden_states).sample
-
-            # Compute losses
-            lpips_loss = self.loss_fn(perturbed_images_, input_tensor.to(dtype=weight_dtype)).mean()
-            denoising_loss = F.mse_loss(model_pred.float(), noise.float())
-
-            # SSIM and brightness loss
-            ssim_loss = 1 - ssim(perturbed_images_, input_tensor.to(dtype=weight_dtype), data_range=1.0)
-            brightness_loss = torch.mean(torch.abs(perturbed_images_ - input_tensor.to(dtype=weight_dtype)))
-
-            # original_image_tensor = input_tensor.clone().detach()
-            # output_image = self.model(prompt=prompt, image=perturbed_images_, strength=0.5, guidance_scale=5).images[0]
-            # output_tensor = preprocess_input(output_image).unsqueeze(0).to(device).float()
-            # ssim_loss = 1 - ssim(output_tensor, original_image_tensor, data_range=1.0)
-            # brightness_loss = torch.mean(torch.abs(output_tensor - original_image_tensor))
-
-            combined_loss = 0.5 * denoising_loss + 0.3 * lpips_loss + 0.1 * ssim_loss + 0.1 * brightness_loss
-
-            # Update the strongest adversarial image if the current loss is higher
-            if combined_loss.item() > max_loss:
-                max_loss = combined_loss.item()
-                strongest_adv_img = perturbed_images.clone().detach()
-
-            # Backpropagation
-            combined_loss.backward()
-
-            # Update perturbation
+                latent_original = self.vae.encode(input_tensor.to(dtype=torch.float16)).latent_dist.mean.to(dtype=torch.float32)
             with torch.no_grad():
-                grad = perturbed_images.grad.clone()
-                mask_grad = grad * combined_mask_tensor * self.alpha
-                non_mask_grad = grad * (1 - combined_mask_tensor) * self.non_mask_alpha
+                latents = self.vae.encode(perturbed_images_).latent_dist.sample()
+                latents = latents * self.vae.config.scaling_factor
+
+            noise = torch.randn_like(latents)
+            timesteps = torch.randint(0, self.noise_scheduler.config.num_train_timesteps, (1,), device=latents.device).long()
+            noisy_latents = self.noise_scheduler.add_noise(latents, noise, timesteps)
+
+            # 6. U-Net 예측
+            model_pred = self.model.unet(noisy_latents, timesteps, perturbed_hidden_states).sample
+
+            # 7. 손실 계산
+            perturbed_images_ = perturbed_images_.to(dtype=torch.float32)
+            loss = self.compute_loss(perturbed_images_, input_tensor, model_pred, noise, mask_tensor, latent_original)
+
+
+            # 최적의 적대적 예제 저장
+            if loss.item() > max_loss:
+                max_loss = loss.item()
+                best_adv_img = perturbed_images.clone().detach()
+
+            # 8. 역전파 및 업데이트
+            loss.backward(retain_graph=True)
+            with torch.no_grad():
+                grad = perturbed_images.grad.data
+
+                # 모멘텀 업데이트
+                momentum = self.momentum_factor * momentum + grad / torch.norm(grad, p=1)  # L1 정규화
+
+                # 마스킹된 영역과 비마스킹 영역에 각각 다른 강도로 그래디언트 적용
+                mask_grad = momentum * mask_tensor * self.alpha  # 마스킹된 영역
+                non_mask_grad = momentum * (1 - mask_tensor) * self.non_mask_alpha  # 비마스킹된 영역
                 total_grad = mask_grad + non_mask_grad
 
-                # Update momentum
-                self.momentum = self.momentum_factor * self.momentum + total_grad / (torch.norm(total_grad) + 1e-8)
-                perturbed_images = perturbed_images + self.alpha * self.momentum.sign()
+                # Perturbation 업데이트
+                perturbed_images = perturbed_images + total_grad.sign()
 
-                # Clamp perturbations
-                mask_eta = torch.clamp(perturbed_images - original_images, -self.adversarial_budget, self.adversarial_budget)
-                non_mask_eta = torch.clamp(perturbed_images - original_images, -self.non_mask_budget, self.non_mask_budget)
+                # 마스킹된 영역과 비마스킹된 영역 각각의 노이즈 강도 제한
                 perturbed_images = torch.clamp(
-                    original_images + (mask_eta * combined_mask_tensor) + (non_mask_eta * (1 - combined_mask_tensor)), 
+                    input_tensor + torch.clamp(perturbed_images - input_tensor, 
+                                            -self.adversarial_budget, self.adversarial_budget) * mask_tensor +
+                    torch.clamp(perturbed_images - input_tensor, 
+                                -self.non_mask_budget, self.non_mask_budget) * (1 - mask_tensor),
                     0, 1
                 ).detach_().requires_grad_(True)
 
-                # Clear GPU cache every 10 steps
-                if step % 10 == 0:
-                    torch.cuda.empty_cache()
+        print(f"Max Loss Achieved: {max_loss:.4f}")
 
-            print(f"Step {step + 1}/{self.steps} | LPIPS Loss: {lpips_loss.item():.4f} | Denoising Loss: {denoising_loss.item():.4f} | SSIM Loss: {ssim_loss.item():.4f} | Brightness Loss: {brightness_loss:.4f} | Max Loss: {max_loss:.4f}")
-
-        # Return the strongest adversarial image
-        if strongest_adv_img is not None:
-            adversarial_image = transforms.ToPILImage()(strongest_adv_img.squeeze().cpu())
+        # 최종 적대적 이미지 반환
+        if best_adv_img is not None:
+            adversarial_image = transforms.ToPILImage()(best_adv_img.squeeze().cpu())
         else:
             adversarial_image = transforms.ToPILImage()(perturbed_images.squeeze().cpu())
         return adversarial_image
 
+
 # 5. Main
 if __name__ == "__main__":
-    # Set seed
+    # Set a good seed
     seed = 42
     torch.manual_seed(seed)
     random.seed(seed)
     np.random.seed(seed)
 
     # Load the model
-    model_name = "CompVis/stable-diffusion-v1-4"
+    model_name = "runwayml/stable-diffusion-v1-5"
     # "stabilityai/stable-diffusion-2-1"
     # "runwayml/stable-diffusion-v1-5"
     # "CompVis/stable-diffusion-v1-4"
@@ -221,7 +267,18 @@ if __name__ == "__main__":
     # "A highly detailed portrait of a smiling person with exaggerated facial features, surreal lighting, and hyper-realistic details"
 
     # Initialize attack
-    attack = Img2ImgAdversarialAttack(model=model, adversarial_budget=8/255, alpha=2/255, steps=100, momentum_factor=0.9, non_mask_budget=4/255, non_mask_alpha=1/255)
+    attack = Img2ImgAdversarialAttack(
+        model=model,
+        vae=model.vae,
+        tokenizer=model.tokenizer,
+        noise_scheduler=model.scheduler,
+        adversarial_budget=4/255,
+        alpha=1/255,
+        steps=100,
+        momentum_factor=0.9,
+        non_mask_budget=2/255,
+        non_mask_alpha=0.5/255
+    )
     start_time = time.time()
     adversarial_image = attack.generate_adversarial(input_image, prompt)
     end_time = time.time()
@@ -231,9 +288,8 @@ if __name__ == "__main__":
     adversarial_image.save("adversarial_image.png")
 
     # Generate outputs
-    adversarial_output = model(prompt, image=adversarial_image, strength=0.5, guidance_scale=5).images[0] # model(prompt=prompt, image=adversarial_image, strength=0.4, guidance_scale=5.5).images[0]
-    original_output= model(prompt, image=input_image, strength=0.5, guidance_scale=5).images[0]
-    # original_output = model(prompt=prompt, image=input_image, strength=0.4, guidance_scale=5.5).images[0]
+    adversarial_output = model(prompt, image=adversarial_image, strength=0.6, guidance_scale=7).images[0]
+    original_output= model(prompt, image=input_image, strength=0.6, guidance_scale=7).images[0]
 
     # Save and show outputs
     adversarial_output.save("adversarial_output.png")
@@ -274,17 +330,18 @@ if __name__ == "__main__":
     noise_image.show()
     noise_image.save("noise_image.png")
 
+    # 일단 주석 처리
+    
     # Text-to-image example
     # txt2img_model = load_txt2img_model(model_name)
     # test_image = txt2img_model(prompt="person riding a bike", guidance_scale=5.5).images[0]
     # test_image.show()
 
-    # 일단 주석 처리
-    
-
     # Create output directory if it doesn't exist
     output_dir = "outputs"
+    adversarial_dir = "adversarial"
     os.makedirs(output_dir, exist_ok=True)
+    os.makedirs(adversarial_dir, exist_ok=True)
 
     # CSV file to save metrics
     csv_file = "metrics.csv"
@@ -301,12 +358,17 @@ if __name__ == "__main__":
             base_filename = os.path.splitext(filename)[0]
 
             input_image = load_image(file_path)
-            prompt = "portrait of a person with a neutral expression, purple hair"
+            prompt = "portrait of a person with a neutral expression"
 
+            start_time = time.time()
             adversarial_image = attack.generate_adversarial(input_image, prompt)
+            end_time = time.time()
 
-            adversarial_output = model(prompt, image=adversarial_image, strength=0.5, guidance_scale=5).images[0]
-            original_output = model(prompt, image=input_image, strength=0.5, guidance_scale=5).images[0]
+            adversarial_image.save(os.path.join(adversarial_dir, f"{base_filename}_adversarial_example.png"))
+            print(f"Adversarial example generated in {end_time - start_time:.2f} seconds.")
+
+            adversarial_output = model(prompt, image=adversarial_image, strength=0.6, guidance_scale=7).images[0]
+            original_output = model(prompt, image=input_image, strength=0.6, guidance_scale=7).images[0]
 
             adversarial_output.save(os.path.join(output_dir, f"{base_filename}_adversarial_output.png"))
             original_output.save(os.path.join(output_dir, f"{base_filename}_original_output.png"))
@@ -326,6 +388,13 @@ if __name__ == "__main__":
 
             ssim_adversarial = ssim(adversarial_output_tensor, adversarial_tensor, data_range=1.0).item()
             psnr_adversarial = psnr(adversarial_output_tensor, adversarial_tensor, data_range=1.0).item()
+
+
+            # Calculate and visualize noise
+            noise_tensor = adversarial_tensor - input_tensor
+            noise_tensor = (noise_tensor - noise_tensor.min()) / (noise_tensor.max() - noise_tensor.min())  # Normalize to [0, 1]
+            noise_image = transforms.ToPILImage()(noise_tensor.squeeze().cpu())
+            noise_image.save(os.path.join(adversarial_dir, f"{base_filename}_noise.png"))
 
             with open(csv_file, mode="a", newline="") as file:
                 writer = csv.writer(file)
