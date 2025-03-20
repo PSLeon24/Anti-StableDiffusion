@@ -21,7 +21,7 @@ In this work, adversarial perturbation 𝛿 via optimization algorithm is genera
 
 ### Environment Setup
 
-Pretrained checkpoints of different Stable Diffusion versions can be downloaded from provided links in the table below:
+Pretrained checkpoints of different Stable Diffusion versions can be downloaded from the provided links in the table below:
 |Version|Link|
 |:--:|:--:|
 |2.1|<a href="https://huggingface.co/stabilityai/stable-diffusion-2-1-base">stable-diffusion-2-1-base</a>|
@@ -30,7 +30,7 @@ Pretrained checkpoints of different Stable Diffusion versions can be downloaded 
 
 ### Usage
 ```
-stable-diffusion-attack/
+Anti-StableDiffusionk/
 ├── DeepfakeShield.py            
 ├── Test/                  # Folder containing input test images
 ├── adversarial_image.png  # Generated adversarial example (output)
