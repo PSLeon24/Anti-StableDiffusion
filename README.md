@@ -10,7 +10,9 @@ In this work, adversarial perturbation 𝛿 via optimization algorithm is genera
 
 ![image](https://github.com/user-attachments/assets/e2526533-8950-4db0-9e76-a3be05c20f5d)
 
-### Result
+### Experiments
+- Evaluation Metrics: PSNR, SSIM, FID
+  
 - Quantitative Results
   
 ![image](https://github.com/user-attachments/assets/a6f0447a-4b4f-4e16-bdea-034650c03ca8)
@@ -43,49 +45,4 @@ Anti-StableDiffusionk/
 2. Install dependencies: ```pip install -r requirements.txt```
 
 #### Dataset Preparation
-
----
-
-## 1. Requirements Analysis
-### Objective
-  - The objective is to design a system capable of generating adaptive adversarial examples to disrupt diverse versions of the Stable Diffusion img2img pipeline.
-  - The system must:
-    - Dynamically tune attack hyperparameters based on input image properties and loss behaviors.
-    - Ensure visually imperceptible perturbations while maximizing disruption.
-    - Support efficient computation for high-resolution image pipelines.
-### Key Features
-  - Adaptive tuning of attack parameters (epsilon, alpha, steps, momentum_factor) per image.
-  - Utilization of perceptual (LPIPS), structural (SSIM), and brightness losses for optimization.
-  - High compatibility with Hugging Face's StableDiffusionImg2ImgPipeline.
-### System Requirements
-  - Hardware: CUDA-enabled GPU with at least 8GB VRAM.
-  - Software: Python 3.8+
-  - Libraries: PyTorch, Hugging Face Diffusers, LPIPS, TorchMetrics, Pillow.
-
-## 2. Design
-- The system is designed to disrupt the Stable Diffusion img2img pipeline using an adaptive approach.
-
-### Modules
-- Image Preprocessing:
-  - Resizes and normalizes input images for compatibility with Stable Diffusion pipelines.
-- Stable Diffusion Pipeline:
-  - A pre-trained img2img model from Hugging Face.
-- Loss Functions:
-  - Combines LPIPS, SSIM, and brightness losses to optimize perturbations.
-- Adaptive Hyperparameter Module:
-  - Dynamically tunes attack parameters based on image complexity and loss gradients.
-- Perturbation Generator:
-  - Iteratively updates input tensors to apply adversarial perturbations.
-### Workflow
-- Input Image Processing:
-  - Preprocess input to match Stable Diffusion requirements (512x512 resolution, RGB).
-- Loss-Based Optimization:
-  - Calculate perceptual and structural losses between the input and output images.
-- Dynamic Parameter Adjustment:
-  - Adjust hyperparameters (epsilon, alpha, steps, momentum_factor) during the attack.
-- Adversarial Image Generation:
-  - Generate adversarial examples iteratively and save results.
-
-## 3. Metrics:
- - PSNR, SSIM, FID
-
+- To be written.
