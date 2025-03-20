@@ -1,14 +1,23 @@
-# Deepfake-Shield
+# Anti-StableDiffusion
 ### Objective
-The goal of this project is to advance our research on disrupting deepfakes to a level where it can be presented at ICML 2025. This project aims to develop effective techniques that can interfere with the creation or dissemination of deepfake content, rendering it unusable or easily identifiable as manipulated.
+In this work, adversarial perturbation 𝛿 via optimization algorithm is generated as follows:
 
-![image](https://github.com/user-attachments/assets/4a83d5c5-6371-42e5-90c0-5774edbb7c9a)
+![image](https://github.com/user-attachments/assets/99b86b64-478b-40cb-9e20-779de063af7f)
 
-### Abstract
-Deepfake-Shield is a system designed to counter deepfake technology by introducing methods that actively disrupt the deepfake generation process or degrade the quality of deepfakes to make them less convincing. By leveraging adversarial techniques, noise injection, and data manipulation, this project provides a proactive approach to mitigating the risks posed by deepfake technology.
+![image](https://github.com/user-attachments/assets/729e01d7-44fb-4c9a-b142-2b4fc44ccf0a)
+
+- Example of (a) original image, (b) adversarial example, and (c) adversarial perturbations (5x amplified)
+
+![image](https://github.com/user-attachments/assets/e2526533-8950-4db0-9e76-a3be05c20f5d)
 
 ### Result
-![image](https://github.com/user-attachments/assets/1177b9f3-b90e-4446-abad-efc6bae5575f)
+- Quantitative Results
+  
+![image](https://github.com/user-attachments/assets/a6f0447a-4b4f-4e16-bdea-034650c03ca8)
+
+- Qualitative Results
+  
+![image](https://github.com/user-attachments/assets/ce95850f-28e7-41ba-8fce-57823ac6f96c)
 
 ### Environment Setup
 
@@ -35,18 +44,6 @@ stable-diffusion-attack/
 
 #### Dataset Preparation
 
-
-### Citation
-
-```
-@inproceedings{Citation Key,
-  title={Deepfake-Shield},
-  author={Yeong-Min Ko},
-  booktitle={to be added.},
-  year={2025}
-}
-```
-
 ---
 
 ## 1. Requirements Analysis
@@ -66,8 +63,7 @@ stable-diffusion-attack/
   - Libraries: PyTorch, Hugging Face Diffusers, LPIPS, TorchMetrics, Pillow.
 
 ## 2. Design
-- The system is designed to disrupt the Stable Diffusion img2img pipeline using an adaptive approach. The key modules and their interactions are shown in the following diagram:
-![mysystem](https://github.com/user-attachments/assets/f6badce7-0d82-4db8-9dd3-3b01919321d8)
+- The system is designed to disrupt the Stable Diffusion img2img pipeline using an adaptive approach.
 
 ### Modules
 - Image Preprocessing:
@@ -90,17 +86,6 @@ stable-diffusion-attack/
 - Adversarial Image Generation:
   - Generate adversarial examples iteratively and save results.
 
+## 3. Metrics:
+ - PSNR, SSIM, FID
 
-## 3. Implementation
-
-## 4. Testing
-### Metrics:
- - LPIPS Distance: Evaluates perceptual similarity between original and adversarial outputs.
- - SSIM Score: Measures structural similarity between original and adversarial outputs.
-
-## 5. Maintenance
-
-### References
-[1] Hugging Face Diffusers Documentation: https://huggingface.co/docs/diffusers
-[2] LPIPS (Learned Perceptual Image Patch Similarity): https://github.com/richzhang/PerceptualSimilarity
-[3] PyTorch Documentation: https://pytorch.org
